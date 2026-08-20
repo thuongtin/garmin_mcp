@@ -1,0 +1,23 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "garmin-mcp-oauth",
+  "account_id": "31c6286f65f3f17c109c51e75c4a228e",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-20",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "21c59c19bba0475d81ea170205b9cb6a"
+    }
+  ],
+  "vars": {
+    "ORIGIN_URL": "https://garmin.thuongtin.com"
+  }
+}

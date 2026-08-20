@@ -18,6 +18,7 @@ build/
 .claude.md
 .mcp.json
 docs/*
+!docs/mikrotik-cloudflare-claude.md
 .gitignore
 playground/*
 scratch/*

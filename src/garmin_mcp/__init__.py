@@ -383,6 +383,12 @@ def main():
     #   GARMIN_MCP_PORT      - bind port for HTTP transports (default 8000)
     try:
         transport, http_host, http_port = _parse_transport_config()
+        http_token = None
+        if transport != "stdio":
+            from garmin_mcp.http_auth import assert_http_bind_allowed, attach_bearer_middleware, get_http_auth_token
+
+            http_token = get_http_auth_token()
+            assert_http_bind_allowed(http_host, http_token)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)
@@ -418,6 +424,8 @@ def main():
     # Create the MCP app, wrapped so the env-var filter can drop tools.
     # host/port only matter for the HTTP transports; stdio ignores them.
     fastmcp = FastMCP("Garmin Connect v1.0", host=http_host, port=http_port)
+    if transport != "stdio" and http_token:
+        attach_bearer_middleware(fastmcp, http_token)
     app = _ToolFilter(fastmcp, enabled_tools, disabled_tools)
     if enabled_tools:
         print(f"Tool filter: allowlist of {len(enabled_tools)} tool(s).", file=sys.stderr)
@@ -461,6 +469,12 @@ def main():
         @fastmcp.custom_route("/healthz", methods=["GET"])
         async def healthz(_request: "Request") -> "PlainTextResponse":
             return PlainTextResponse("ok")
+
+        from starlette.responses import JSONResponse
+
+        @fastmcp.custom_route("/health", methods=["GET"])
+        async def health(_request: "Request") -> "JSONResponse":
+            return JSONResponse({"ok": True, "name": "garmin-mcp", "mcp": "/mcp"})
 
         print(
             f"Serving MCP over {transport} on {http_host}:{http_port}",

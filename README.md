@@ -446,7 +446,9 @@ When an HTTP transport is selected:
 - MCP clients connect to the **`/mcp`** path (e.g. `http://localhost:8000/mcp`).
 - A plain **`GET /healthz`** endpoint is exposed for liveness/readiness probes.
 
-The server itself performs **no authentication** on the HTTP endpoint — put it behind a reverse proxy (nginx, Traefik, Authelia, etc.) if it is reachable beyond localhost.
+Off-loopback binds (`GARMIN_MCP_HOST=0.0.0.0`) require `GARMIN_MCP_HTTP_TOKEN`. `/health` and `/healthz` stay public. Put the origin behind Cloudflare Access as well when it is on the internet.
+
+Remote MikroTik + Cloudflare Worker + Claude.ai: see `docs/mikrotik-cloudflare-claude.md` and the shared playbook `oura-mcp/docs/remote-mcp-mikrotik-claude.md`.
 
 ### Garmin Connect China (garmin.cn)
 
