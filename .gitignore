@@ -24,3 +24,6 @@ playground/*
 scratch/*
 tests/fixtures/captured/*
 !tests/fixtures/captured/poc_walk_run.json
+
+# Container image exports for MikroTik
+*-arm64.tar
