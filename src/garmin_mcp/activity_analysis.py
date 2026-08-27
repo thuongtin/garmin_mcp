@@ -10,6 +10,7 @@ Exposes data not available through the REST API:
 - HR drift / cardiac drift (aerobic decoupling)
 - Temperature correlation with HR and power
 - Variability Index per session and lap
+- Stryd / Connect IQ running power, including per-lap power that the REST API omits
 """
 import gzip
 import io
@@ -1046,6 +1047,218 @@ def _parse_fit(fit_bytes: bytes, include_records: bool) -> dict:
 # MCP tool registration
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Connect IQ developer fields (Stryd running power)
+# ---------------------------------------------------------------------------
+
+# Field names Stryd's Connect IQ data field declares in field_description.
+# Used only for detection; the actual numbers are read from the file itself
+# because they are app-version specific and not part of the FIT SDK.
+_STRYD_SIGNATURE_FIELDS = {
+    "Power",
+    "Form Power",
+    "Air Power",
+    "Leg Spring Stiffness",
+    "Ground Time",
+    "Vertical Oscillation",
+    "Impact Loading Rate",
+    "Lap Power",
+}
+
+# field_description.native_mesg_num when fitparse cannot resolve it to a name.
+_FIT_MESG_NUM_NAMES = {18: "session", 19: "lap", 20: "record"}
+
+_STRYD_ZONE_NAMES = ["Easy", "Moderate", "Threshold", "Interval", "Repetition"]
+_STRYD_DEFAULT_ZONE_BOUNDS_PCT = [80, 90, 100, 115]
+_STRYD_ZONE_NOTE = (
+    "Stryd does not publish exact numeric zone boundaries. These defaults follow "
+    "the common percent-of-CP 5-zone model; override with zone_upper_bounds_pct."
+)
+
+
+def _clean_fit_string(value) -> Optional[str]:
+    """Normalise a FIT string field, which may arrive as a char array."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        parts = [str(v) for v in value if v not in (None, "")]
+        if not parts:
+            return None
+        value = "".join(parts)
+    return str(value).replace("\x00", "").strip() or None
+
+
+def _describe_developer_field(message) -> Optional[Dict[str, Any]]:
+    """Turn a field_description message into a developer field descriptor."""
+    name = _clean_fit_string(message.get_value("field_name"))
+    if not name:
+        return None
+    scope = message.get_value("native_mesg_num")
+    if isinstance(scope, int):
+        scope = _FIT_MESG_NUM_NAMES.get(scope)
+    else:
+        scope = _clean_fit_string(scope)
+    return {
+        "number": message.get_value("field_definition_number"),
+        "name": name,
+        "units": _clean_fit_string(message.get_value("units")),
+        "scope": scope,
+    }
+
+
+def _compute_normalized_power(values: List[float], window_s: int = 30) -> Optional[int]:
+    """Normalized Power: 4th root of the mean of the 30s rolling average^4."""
+    vals = [v for v in values if isinstance(v, (int, float))]
+    if len(vals) < window_s:
+        return None
+    total = sum(vals[:window_s])
+    rolling = [total / window_s]
+    for i in range(window_s, len(vals)):
+        total += vals[i] - vals[i - window_s]
+        rolling.append(total / window_s)
+    return round((sum(r ** 4 for r in rolling) / len(rolling)) ** 0.25)
+
+
+def _compute_stryd_power_zones(
+    power_values: List[float],
+    critical_power: Optional[float],
+    source: Optional[str],
+    upper_bounds_pct: Optional[List[float]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Distribute power samples across percent-of-CP zones."""
+    if not critical_power or critical_power <= 0 or not power_values:
+        return None
+
+    bounds_pct = list(upper_bounds_pct or _STRYD_DEFAULT_ZONE_BOUNDS_PCT)
+    bounds_w = [critical_power * pct / 100.0 for pct in bounds_pct]
+
+    counts = [0] * (len(bounds_w) + 1)
+    for value in power_values:
+        counts[sum(1 for bound in bounds_w if value >= bound)] += 1
+
+    total = len(power_values)
+    zones = []
+    for index, count in enumerate(counts):
+        lower = bounds_w[index - 1] if index else 0.0
+        upper = bounds_w[index] if index < len(bounds_w) else None
+        zones.append({
+            "zone": index + 1,
+            "name": (
+                _STRYD_ZONE_NAMES[index]
+                if index < len(_STRYD_ZONE_NAMES)
+                else f"Zone {index + 1}"
+            ),
+            "lower_w": _safe_round(lower, 1),
+            "upper_w": _safe_round(upper, 1),
+            "samples": count,
+            "percent": _safe_round(100.0 * count / total, 1),
+        })
+
+    return {
+        "critical_power_w": critical_power,
+        "critical_power_source": source,
+        "zone_model": "percent_of_cp",
+        "upper_bounds_pct_of_cp": bounds_pct,
+        "note": _STRYD_ZONE_NOTE,
+        "zones": zones,
+    }
+
+
+def _parse_stryd_fit(fit_bytes: bytes, include_records: bool = False) -> Dict[str, Any]:
+    """Extract Connect IQ developer fields from a FIT file.
+
+    Field numbers are never hardcoded: every name, unit and scope is read from
+    the file's own field_description messages, so a Stryd app update that
+    renumbers or adds fields keeps working.
+    """
+    fit_bytes = _extract_fit_bytes(fit_bytes)
+    fitfile = fitparse.FitFile(io.BytesIO(fit_bytes))
+
+    developer_fields: List[Dict[str, Any]] = []
+    seen_names = set()
+    names_by_scope: Dict[str, List[str]] = {"record": [], "lap": [], "session": []}
+
+    session: Dict[str, Any] = {}
+    laps: List[Dict[str, Any]] = []
+    records: List[Dict[str, Any]] = []
+    series: Dict[str, List[Any]] = {}
+
+    for message in fitfile.get_messages():
+        msg_type = message.name
+
+        if msg_type == "field_description":
+            descriptor = _describe_developer_field(message)
+            if descriptor and descriptor["name"] not in seen_names:
+                seen_names.add(descriptor["name"])
+                developer_fields.append(descriptor)
+                bucket = names_by_scope.get(descriptor["scope"])
+                if bucket is not None:
+                    bucket.append(descriptor["name"])
+
+        elif msg_type == "record":
+            row = {}
+            for name in names_by_scope["record"]:
+                value = message.get_value(name)
+                if value is None:
+                    continue
+                row[name] = value
+                series.setdefault(name, []).append(value)
+            if row and include_records:
+                records.append(row)
+
+        elif msg_type == "lap":
+            lap: Dict[str, Any] = {
+                "lap": len(laps) + 1,
+                "total_distance_m": _safe_round(message.get_value("total_distance"), 2),
+                "total_timer_time_s": _safe_round(message.get_value("total_timer_time"), 3),
+                "avg_speed_mps": _safe_round(
+                    _get_field(message, "enhanced_avg_speed", "avg_speed"), 3
+                ),
+                "avg_heart_rate": message.get_value("avg_heart_rate"),
+                "avg_cadence": message.get_value("avg_cadence"),
+            }
+            lap_stryd = {
+                name: message.get_value(name)
+                for name in names_by_scope["lap"]
+                if message.get_value(name) is not None
+            }
+            if lap_stryd:
+                lap["stryd"] = lap_stryd
+            laps.append(lap)
+
+        elif msg_type == "session":
+            session = {
+                "start_time": message.get_value("start_time"),
+                "sport": message.get_value("sport"),
+                "sub_sport": message.get_value("sub_sport"),
+                "total_distance_m": _safe_round(message.get_value("total_distance"), 2),
+                "total_timer_time_s": _safe_round(message.get_value("total_timer_time"), 3),
+                "total_elapsed_time_s": _safe_round(
+                    message.get_value("total_elapsed_time"), 3
+                ),
+                "avg_heart_rate": message.get_value("avg_heart_rate"),
+                "max_heart_rate": message.get_value("max_heart_rate"),
+            }
+            session_stryd = {
+                name: message.get_value(name)
+                for name in names_by_scope["session"]
+                if message.get_value(name) is not None
+            }
+            if session_stryd:
+                session["stryd"] = session_stryd
+
+    result: Dict[str, Any] = {
+        "developer_fields": developer_fields,
+        "stryd_detected": bool(seen_names & _STRYD_SIGNATURE_FIELDS),
+        "session": session,
+        "laps": laps,
+        "series": series,
+    }
+    if include_records:
+        result["records"] = records
+    return result
+
+
 def register_tools(app):
     """Register all activity analysis tools with the MCP server app"""
 
@@ -1145,6 +1358,186 @@ def register_tools(app):
 
         except Exception as e:
             return f"Error downloading FIT data for activity {activity_id}: {str(e)}"
+
+    @app.tool()
+    async def get_activity_stryd_power(
+        activity_id: Union[int, str],
+        include_records: bool = False,
+        critical_power: Optional[float] = None,
+        zone_upper_bounds_pct: Optional[List[float]] = None,
+    ) -> str:
+        """Extract Stryd (Connect IQ) running power from an activity's FIT file.
+
+        Watches that pair Stryd as an ANT+ footpod (e.g. Forerunner 945) record power
+        only as Connect IQ developer fields. Garmin's REST API therefore returns nothing
+        for get_activity_power_in_timezones, and the /splits endpoint returns
+        connectIQMeasurements: null. This tool reads the FIT file directly.
+
+        Data exposed that the REST API does not provide at all:
+        - Lap Power per lap (the activity/details endpoint only has per-record values)
+        - The authoritative field names, units and scopes, read from the FIT file's own
+          field_description messages rather than a hardcoded number mapping (Stryd
+          renumbers fields between app versions)
+
+        Also returned:
+        - Power summary: avg / min / max, Normalized Power, Power Duration Curve
+        - pod_connected flag: all-zero power means the pod never paired and the power
+          data for that activity is lost, not merely low
+        - Every other record-scope developer field summarised (Form Power, Air Power,
+          Ground Time, Vertical Oscillation, Leg Spring Stiffness, Impact Loading Rate...)
+        - Session-scope fields including CP, Weight, Height and the baseline conditions
+        - Power zone distribution when a Critical Power is available
+
+        Zone boundaries: Stryd does not publish exact numeric boundaries, so the default
+        percent-of-CP bounds [80, 90, 100, 115] are stated explicitly in the response and
+        can be overridden. Zones are omitted entirely when no CP is known rather than
+        computed against an invented number.
+
+        Args:
+            activity_id: Garmin activity ID
+            include_records: Include the full per-second developer field time series
+                             (default False; adds significant volume for long runs).
+            critical_power: CP in watts. Overrides the CP stored in the FIT session,
+                            which is 0 until it is set in the Stryd data field settings.
+            zone_upper_bounds_pct: Upper bounds of each zone as a percent of CP, e.g.
+                                   [80, 90, 100, 115] produces 5 zones.
+        """
+        if not FITPARSE_AVAILABLE:
+            return (
+                "fitparse library is not installed. "
+                "Install it with: pip install fitparse"
+            )
+
+        try:
+            activity_id = int(activity_id)
+            from garminconnect import Garmin
+
+            fit_bytes = garmin_client.download_activity(
+                activity_id,
+                dl_fmt=Garmin.ActivityDownloadFormat.ORIGINAL,
+            )
+
+            if not fit_bytes:
+                return f"No FIT data returned for activity {activity_id}"
+
+            raw = bytes(fit_bytes)
+
+            try:
+                parsed = _parse_stryd_fit(raw, include_records=include_records)
+            except Exception as parse_err:
+                return json.dumps({
+                    "error": str(parse_err),
+                    "debug": {
+                        "total_bytes": len(raw),
+                        "first_16_bytes_hex": raw[:16].hex(),
+                        "hint": (
+                            "1f8b = gzip, 504b = ZIP, 0e10/0c10 = raw FIT, "
+                            "3c or 7b = HTML/JSON error from Garmin"
+                        ),
+                    }
+                }, indent=2)
+
+            series = parsed.pop("series", {})
+            parsed["activity_id"] = activity_id
+
+            if not parsed["stryd_detected"]:
+                parsed["hint"] = (
+                    "No Stryd Connect IQ developer fields found in this FIT file. "
+                    "The pod was not recording, or the Stryd data field was not on the "
+                    "active watch screen for this activity."
+                )
+                return json.dumps(parsed, indent=2, default=str)
+
+            warnings: List[str] = []
+            session = parsed.get("session") or {}
+            session_stryd = session.get("stryd") or {}
+
+            # Power summary
+            power_values = [
+                v for v in series.get("Power", []) if isinstance(v, (int, float))
+            ]
+            zero_samples = sum(1 for v in power_values if v == 0)
+            pod_connected = bool(power_values) and zero_samples < len(power_values)
+            power: Dict[str, Any] = {
+                "samples": len(power_values),
+                "zero_samples": zero_samples,
+                "pod_connected": pod_connected,
+                "avg_w": _safe_round(_safe_avg(power_values), 1),
+                "min_w": min(power_values) if power_values else None,
+                "max_w": max(power_values) if power_values else None,
+                "normalized_power_w": _compute_normalized_power(power_values),
+                "power_duration_curve": _compute_power_duration_curve(
+                    [{"power_w": v} for v in power_values]
+                ),
+            }
+            if power_values and not pod_connected:
+                warnings.append(
+                    f"Stryd power is zero for all {len(power_values)} records: the pod "
+                    "was not connected during this activity and the power data is lost."
+                )
+            parsed["power"] = power
+
+            # Every other record-scope developer field
+            units_by_name = {
+                field["name"]: field["units"] for field in parsed["developer_fields"]
+            }
+            metrics: Dict[str, Any] = {}
+            for name, values in series.items():
+                if name == "Power":
+                    continue
+                numeric = [v for v in values if isinstance(v, (int, float))]
+                if not numeric:
+                    continue
+                metrics[name] = {
+                    "units": units_by_name.get(name),
+                    "samples": len(numeric),
+                    "avg": _safe_round(_safe_avg(numeric), 1),
+                    "min": min(numeric),
+                    "max": max(numeric),
+                }
+            parsed["metrics"] = metrics
+
+            # Weight: Stryd carries its own setting, which is what it used for W/kg
+            weight_kg = None
+            weight_source = None
+            session_weight = session_stryd.get("Weight")
+            if isinstance(session_weight, (int, float)) and session_weight > 0:
+                weight_kg, weight_source = float(session_weight), "fit_session"
+            else:
+                start_time = str(session.get("start_time") or "")
+                activity_date = start_time[:10] if start_time else None
+                if activity_date:
+                    profile_weight = _get_rider_weight_kg(activity_date)
+                    if profile_weight:
+                        weight_kg, weight_source = profile_weight, "garmin_profile"
+            parsed["weight_kg"] = weight_kg
+            parsed["weight_source"] = weight_source
+            if weight_kg and power["avg_w"]:
+                power["avg_w_per_kg"] = round(power["avg_w"] / weight_kg, 2)
+
+            # Power zones
+            session_cp = session_stryd.get("CP")
+            if critical_power and critical_power > 0:
+                cp, cp_source = critical_power, "caller"
+            elif isinstance(session_cp, (int, float)) and session_cp > 0:
+                cp, cp_source = session_cp, "fit_session"
+            else:
+                cp, cp_source = None, None
+                warnings.append(
+                    "CP is 0 or missing in the FIT session, so power zones were not "
+                    "computed. Set CP in the Stryd data field settings on the watch, "
+                    "pass critical_power, or wait for Stryd to auto-calculate it."
+                )
+            parsed["power_zones"] = _compute_stryd_power_zones(
+                power_values, cp, cp_source, zone_upper_bounds_pct
+            )
+
+            parsed["warnings"] = warnings
+
+            return json.dumps(parsed, indent=2, default=str)
+
+        except Exception as e:
+            return f"Error reading Stryd power for activity {activity_id}: {str(e)}"
 
     @app.tool()
     async def get_power_duration_curve(

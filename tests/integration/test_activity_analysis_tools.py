@@ -1118,3 +1118,307 @@ async def test_download_activity_file_fit_extraction_failure(
     assert "error" in data
     assert "first_16_bytes_hex" in data["debug"]
     assert not (tmp_path / f"{ACTIVITY_ID}.fit").exists()
+
+
+# ---------------------------------------------------------------------------
+# get_activity_stryd_power - Connect IQ developer fields (Stryd)
+# ---------------------------------------------------------------------------
+
+def _make_field_description(number, name, units, scope):
+    """Create a mock field_description message declaring a developer field."""
+    return _make_mock_fit_message("field_description", {
+        "field_definition_number": number,
+        "field_name": name,
+        "units": units,
+        "native_mesg_num": scope,
+    })
+
+
+def _stryd_descriptions():
+    """Fresh field_description mocks (messages are consumed by iteration)."""
+    return [
+        _make_field_description(0, "Power", "Watts", "record"),
+        _make_field_description(8, "Form Power", "Watts", "record"),
+        _make_field_description(10, "Lap Power", "Watts", "lap"),
+        _make_field_description(99, "CP", "Watts", "session"),
+        _make_field_description(17, "Weight", "kg", "session"),
+    ]
+
+
+async def _call_stryd(app, **kwargs):
+    args = {"activity_id": ACTIVITY_ID}
+    args.update(kwargs)
+    result = await app.call_tool("get_activity_stryd_power", args)
+    return json.loads(result[0][0].text)
+
+
+@pytest.mark.asyncio
+async def test_stryd_reports_not_detected_without_developer_fields(
+    app_with_activity_analysis, mock_garmin_client
+):
+    """Activity with no Connect IQ developer fields reports stryd_detected False"""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    messages = [
+        _make_mock_fit_message("record", {"power": 200, "heart_rate": 150}),
+    ]
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile(messages)
+        data = await _call_stryd(app_with_activity_analysis)
+
+    assert data["stryd_detected"] is False
+    assert data["developer_fields"] == []
+    assert "hint" in data
+
+
+@pytest.mark.asyncio
+async def test_stryd_discovers_developer_fields_dynamically(
+    app_with_activity_analysis, mock_garmin_client
+):
+    """Developer field names/units/scopes come from field_description, not a hardcoded map"""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    messages = _stryd_descriptions() + [
+        _make_mock_fit_message("record", {"Power": 150}),
+    ]
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile(messages)
+        data = await _call_stryd(app_with_activity_analysis)
+
+    assert data["stryd_detected"] is True
+    by_name = {f["name"]: f for f in data["developer_fields"]}
+    assert by_name["Power"]["number"] == 0
+    assert by_name["Power"]["units"] == "Watts"
+    assert by_name["Power"]["scope"] == "record"
+    assert by_name["Lap Power"]["scope"] == "lap"
+    assert by_name["CP"]["scope"] == "session"
+
+
+@pytest.mark.asyncio
+async def test_stryd_power_summary_statistics(
+    app_with_activity_analysis, mock_garmin_client
+):
+    """Record-scope Power is summarised as avg/min/max over the samples"""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    messages = _stryd_descriptions() + [
+        _make_mock_fit_message("record", {"Power": 100}),
+        _make_mock_fit_message("record", {"Power": 200}),
+        _make_mock_fit_message("record", {"Power": 300}),
+    ]
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile(messages)
+        data = await _call_stryd(app_with_activity_analysis)
+
+    power = data["power"]
+    assert power["avg_w"] == 200.0
+    assert power["min_w"] == 100
+    assert power["max_w"] == 300
+    assert power["samples"] == 3
+    assert power["pod_connected"] is True
+
+
+@pytest.mark.asyncio
+async def test_stryd_lap_power_extracted(
+    app_with_activity_analysis, mock_garmin_client
+):
+    """Lap Power exists only in the FIT file, never in the REST splits endpoint"""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    messages = _stryd_descriptions() + [
+        _make_mock_fit_message("lap", {
+            "Lap Power": 154,
+            "total_distance": 1000.0,
+            "total_timer_time": 451.0,
+        }),
+        _make_mock_fit_message("lap", {
+            "Lap Power": 162,
+            "total_distance": 1000.0,
+            "total_timer_time": 430.0,
+        }),
+    ]
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile(messages)
+        data = await _call_stryd(app_with_activity_analysis)
+
+    laps = data["laps"]
+    assert len(laps) == 2
+    assert laps[0]["lap"] == 1
+    assert laps[0]["stryd"]["Lap Power"] == 154
+    assert laps[1]["stryd"]["Lap Power"] == 162
+    assert laps[0]["total_distance_m"] == 1000.0
+
+
+@pytest.mark.asyncio
+async def test_stryd_session_fields_extracted(
+    app_with_activity_analysis, mock_garmin_client
+):
+    """Session-scope developer fields (CP, Weight) are surfaced"""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    messages = _stryd_descriptions() + [
+        _make_mock_fit_message("session", {
+            "CP": 230,
+            "Weight": 65.0,
+            "sport": "running",
+            "total_distance": 5000.0,
+        }),
+    ]
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile(messages)
+        data = await _call_stryd(app_with_activity_analysis)
+
+    assert data["session"]["stryd"]["CP"] == 230
+    assert data["session"]["stryd"]["Weight"] == 65.0
+    assert data["session"]["sport"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_stryd_flags_pod_not_connected_when_power_all_zero(
+    app_with_activity_analysis, mock_garmin_client
+):
+    """All-zero power means the pod was not paired; the data is lost, not merely low"""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    messages = _stryd_descriptions() + [
+        _make_mock_fit_message("record", {"Power": 0}),
+        _make_mock_fit_message("record", {"Power": 0}),
+    ]
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile(messages)
+        data = await _call_stryd(app_with_activity_analysis)
+
+    assert data["power"]["pod_connected"] is False
+    assert data["power"]["zero_samples"] == 2
+    assert any("not connected" in w for w in data["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_stryd_power_zones_computed_from_session_cp(
+    app_with_activity_analysis, mock_garmin_client
+):
+    """Zone distribution uses CP from the FIT session with documented default bounds"""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    messages = _stryd_descriptions() + [
+        _make_mock_fit_message("session", {"CP": 250}),
+        _make_mock_fit_message("record", {"Power": 100}),
+        _make_mock_fit_message("record", {"Power": 210}),
+        _make_mock_fit_message("record", {"Power": 230}),
+        _make_mock_fit_message("record", {"Power": 260}),
+        _make_mock_fit_message("record", {"Power": 300}),
+    ]
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile(messages)
+        data = await _call_stryd(app_with_activity_analysis)
+
+    zones = data["power_zones"]
+    assert zones["critical_power_w"] == 250
+    assert zones["critical_power_source"] == "fit_session"
+    assert zones["upper_bounds_pct_of_cp"] == [80, 90, 100, 115]
+    assert [z["samples"] for z in zones["zones"]] == [1, 1, 1, 1, 1]
+    assert zones["zones"][0]["name"] == "Easy"
+    assert zones["zones"][4]["name"] == "Repetition"
+
+
+@pytest.mark.asyncio
+async def test_stryd_power_zones_accept_caller_supplied_cp(
+    app_with_activity_analysis, mock_garmin_client
+):
+    """Caller CP overrides a missing or zero session CP"""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    messages = _stryd_descriptions() + [
+        _make_mock_fit_message("session", {"CP": 0}),
+        _make_mock_fit_message("record", {"Power": 100}),
+    ]
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile(messages)
+        data = await _call_stryd(app_with_activity_analysis, critical_power=200)
+
+    assert data["power_zones"]["critical_power_w"] == 200
+    assert data["power_zones"]["critical_power_source"] == "caller"
+
+
+@pytest.mark.asyncio
+async def test_stryd_no_zones_without_cp(
+    app_with_activity_analysis, mock_garmin_client
+):
+    """CP of 0 yields no invented zones, only a warning"""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    messages = _stryd_descriptions() + [
+        _make_mock_fit_message("session", {"CP": 0}),
+        _make_mock_fit_message("record", {"Power": 150}),
+    ]
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile(messages)
+        data = await _call_stryd(app_with_activity_analysis)
+
+    assert data["power_zones"] is None
+    assert any("CP" in w for w in data["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_stryd_other_record_metrics_summarised(
+    app_with_activity_analysis, mock_garmin_client
+):
+    """Non-power record developer fields get their own avg/min/max summary"""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    messages = _stryd_descriptions() + [
+        _make_mock_fit_message("record", {"Power": 150, "Form Power": 50}),
+        _make_mock_fit_message("record", {"Power": 150, "Form Power": 60}),
+    ]
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile(messages)
+        data = await _call_stryd(app_with_activity_analysis)
+
+    form = data["metrics"]["Form Power"]
+    assert form["avg"] == 55.0
+    assert form["min"] == 50
+    assert form["max"] == 60
+    assert form["units"] == "Watts"
+
+
+@pytest.mark.asyncio
+async def test_stryd_w_per_kg_uses_session_weight(
+    app_with_activity_analysis, mock_garmin_client
+):
+    """Stryd carries its own weight setting; prefer it over the Garmin profile"""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    messages = _stryd_descriptions() + [
+        _make_mock_fit_message("session", {"Weight": 65.0}),
+        _make_mock_fit_message("record", {"Power": 130}),
+    ]
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile(messages)
+        data = await _call_stryd(app_with_activity_analysis)
+
+    assert data["power"]["avg_w_per_kg"] == 2.0
+    assert data["weight_kg"] == 65.0
+    assert data["weight_source"] == "fit_session"
+
+
+@pytest.mark.asyncio
+async def test_stryd_records_excluded_by_default(
+    app_with_activity_analysis, mock_garmin_client
+):
+    """Full time series only when explicitly requested"""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile(
+            _stryd_descriptions() + [_make_mock_fit_message("record", {"Power": 150})]
+        )
+        default = await _call_stryd(app_with_activity_analysis)
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile(
+            _stryd_descriptions() + [_make_mock_fit_message("record", {"Power": 150})]
+        )
+        with_records = await _call_stryd(app_with_activity_analysis, include_records=True)
+
+    assert "records" not in default
+    assert with_records["records"] == [{"Power": 150}]
